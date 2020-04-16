@@ -1,0 +1,104 @@
+Log-structured storage engine
+15 Apr 2020
+
+Marsel Mavletkulov
+@marselester
+
+* Log
+
+Your favourite database probably uses *log-structured* (LSM) or *page-oriented* storage engine (B-tree)
+
+In this presentation we'll look at ideas behind log-based key-value stores
+
+Log is an append-only file to store sequence of records:
+
+- appending a record to file is very efficient
+- record lookup requires scanning entire file from beginning *O(n)*
+- index helps to locate the record faster *O(1)*
+
+* Hash index
+
+: Suppose an array can hold M key-value pairs, then a hash function should transform
+: any key into an array index in the range [0; M-1]. It should uniformly distribute the keys.
+: Modular hashing is the most commonly used method for hashing integers.
+
+: Linear probing collision-resolution process: check the next entry in the table
+: until finding either the search key or an empty entry.
+: N/M (number of keys / array size) is a percentage of table entries that are occupied (load factor).
+: It must not reach 1 (full table), should be between 1/8 and 1/2 (array is resized).
+: Average number of compares for search is < 1.5, insert is < 2.5. Worst case is O(n).
+
+: Separate chaining collision-resolution process: create linked-list of k/v for each array index.
+: Items that collide are chained together.
+: Since we have M lists (array size) and N keys, the average length of the lists is always N/M.
+: The number of compares for search miss and insert is ~N/M.
+: Average number of compares for search is N/(2*M), insert N/M.
+
+In-memory [[https://godoc.org/github.com/marselester/alg/search/hashtable][hash map]]:
+
+- _key_ points to a byte offset in the log file where record is stored
+- look up record's offset by _key_ from the hash map, then read the record from the log file
+- when a new record is appended, the hash map points to the new offset
+
+Riak's [[https://riak.com/assets/bitcask-intro.pdf][Bitcask]] offers fast reads/writes, but keys must fit in RAM
+
+: On-disk hash map requires random access (slower than RAM)
+
+Range queries in hash map are not efficient because each key has to be found individually
+
+* Segment
+
+If records are appended to one file forever, there will be no disk space left
+
+The log is split into multiple files (segments):
+
+- file is closed when it reaches certain size
+- a new file is created to continue appending records
+- duplicate keys are thrown away from the files (log compaction)
+- compacted segments are merged into a new segment file (old segments are deleted)
+
+* Key lookup in segments
+
+Each segment has its own hash map
+
+- start _key_ lookup from the most recent segment (using its hash map)
+- check second-most-recent segment if key wasn't found
+- since segments are periodically merged (less files), search finishes quickly
+
+I wrote [[https://github.com/marselester/rascaldb][RascalDB 😜]] in order to get a better grasp of the idea
+
+* Deleting keys
+
+Append ☠️ special deletion record (tombstone) to mark the _key_ for deletion
+
+Old records associated with the _key_ will be discarded when segments are merged
+
+* Concurrency
+
+Since appends are sequential, there is only one writer
+
+Multiple readers can read concurrently because segments are immutable
+
+* Crash recovery
+
+Partial writes:
+
+- database might crash while appending a record
+- Bitcask ignores records whose checksums don't match
+
+Index is lost:
+
+- Bitcask stores a snapshot of in-memory hash map on disk to speed up restarts
+- corrupted index can be always created from segment files (slow restart)
+
+* LSM storage engine
+
+Log-Structured Merge-Tree (LSM-Tree) indexing structure:
+
+- records are written into in-memory search tree
+- the tree is periodically saved to a new segment file (keys are sorted)
+
+* References
+
+- [[https://dataintensive.net/][Designing Data-Intensive Applications]] Martin Kleppmann
+- [[https://wikipedia.org/wiki/Log-structured_merge-tree]]
