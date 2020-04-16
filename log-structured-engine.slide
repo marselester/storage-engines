@@ -14,7 +14,7 @@ Log is an append-only file to store sequence of records:
 
 - appending a record to file is very efficient
 - record lookup requires scanning entire file from beginning *O(n)*
-- index helps to locate the record faster *O(1)*
+- index based on hash map helps to locate the record faster *O(1)*
 
 * Hash index
 
@@ -26,13 +26,13 @@ Log is an append-only file to store sequence of records:
 : until finding either the search key or an empty entry.
 : N/M (number of keys / array size) is a percentage of table entries that are occupied (load factor).
 : It must not reach 1 (full table), should be between 1/8 and 1/2 (array is resized).
-: Average number of compares for search is < 1.5, insert is < 2.5. Worst case is O(n).
+: Average number of compares for search is < 1.5, insert is < 2.5. Worst case is O(N).
 
 : Separate chaining collision-resolution process: create linked-list of k/v for each array index.
 : Items that collide are chained together.
 : Since we have M lists (array size) and N keys, the average length of the lists is always N/M.
 : The number of compares for search miss and insert is ~N/M.
-: Average number of compares for search is N/(2*M), insert N/M.
+: Average number of compares for search is N/(2*M), insert N/M. Worst case is O(N).
 
 In-memory [[https://godoc.org/github.com/marselester/alg/search/hashtable][hash map]]:
 
@@ -62,7 +62,7 @@ The log is split into multiple files (segments):
 Each segment has its own hash map
 
 - start _key_ lookup from the most recent segment (using its hash map)
-- check second-most-recent segment if key wasn't found
+- check second-most-recent segment if _key_ wasn't found
 - since segments are periodically merged (less files), search finishes quickly
 
 I wrote [[https://github.com/marselester/rascaldb][RascalDB 😜]] in order to get a better grasp of the idea
@@ -91,14 +91,55 @@ Index is lost:
 - Bitcask stores a snapshot of in-memory hash map on disk to speed up restarts
 - corrupted index can be always created from segment files (slow restart)
 
-* LSM storage engine
+* LSM storage engine (LevelDB, RocksDB)
+
+* LSM-Tree
 
 Log-Structured Merge-Tree (LSM-Tree) indexing structure:
 
 - records are written into in-memory search tree
 - the tree is periodically saved to a new segment file (keys are sorted)
 
+* SSTable (segment)
+
+Sorted String Table log format:
+
+- records are stored in segment file sorted by _key_
+- each _key_ apppears only once within a file
+
+Advantages:
+
+- efficient merging of segments because they are sorted by _key_ ([[https://godoc.org/github.com/marselester/alg/sort/merge][mergesort]])
+- no need to hold all keys (byte offsets) in memory index, one _key_ for every few kilobytes is sufficient
+- a group of records can be compressed into a block (less disk IO, saving disk space)
+- _key_ in sparse index points to a byte offset in segment file where block is stored
+
+* Memtable (tree index)
+
+: Average cost of search/insert in red-black BST is O(lg N), worst case is O(2*lg N).
+
+In-memory [[https://github.com/marselester/binary-search-tree][binary search tree]] (BST) is used to keep keys sorted:
+
+- a new record is added into a balanced tree (memtable), e.g., [[https://godoc.org/github.com/marselester/alg/search/redblack-tree][red-black BST]] *O(lg*n)*
+- the tree is written to disk in SSTable format when the tree is a few megabytes big
+- SSTable is efficiently created from BST because it maintains keys in sorted order
+- new records are added into the new memtable while SSTable is being written to disk
+
+Range queries are efficient since data is stored in sorted order
+
+* Key lookup
+
+- start _key_ lookup from the memtable
+- check the most recent segment (using its sparse index) if _key_ wasn't found
+
+Often LSM storage engines speed up _key_ lookups with [[https://github.com/marselester/bloom][Bloom filters]] to avoid searching for non-existent keys
+
+* Crash recovery
+
+Memtable is lost:
+
+- append every new write into a separate log file to restore memtable on database restart
+
 * References
 
 - [[https://dataintensive.net/][Designing Data-Intensive Applications]] Martin Kleppmann
-- [[https://wikipedia.org/wiki/Log-structured_merge-tree]]
