@@ -109,7 +109,7 @@ Sorted String Table log format:
 
 Advantages:
 
-- efficient merging of segments because they are sorted by _key_ ([[https://godoc.org/github.com/marselester/alg/sort/merge][mergesort]])
+- efficient merging of segments because they are sorted by _key_ (check out k-way merge in [[https://github.com/marselester/hastydb][HastyDB 🚲]]) *O(n*log*k)*
 - no need to hold all keys (byte offsets) in memory index, one _key_ for every few kilobytes is sufficient
 - a group of records can be compressed into a block (less disk IO, saving disk space)
 - _key_ in sparse index points to a byte offset in segment file where block is stored
@@ -143,3 +143,5 @@ Memtable is lost:
 * References
 
 - [[https://dataintensive.net/][Designing Data-Intensive Applications]] Martin Kleppmann
+- [[https://algs4.cs.princeton.edu][Algorithms]] Robert Sedgewick and Kevin Wayne
+- [[https://www.databass.dev][Database Internals]] Alex Petrov
