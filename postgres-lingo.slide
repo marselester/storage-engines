@@ -1,0 +1,249 @@
+PostgreSQL lingo
+Navigating confusing Postgres terminology (HOT, TOAST! 🍞)
+17 Sep 2020
+
+Marsel Mavletkulov
+@marselester
+
+* Relation
+
+PostgreSQL is object-relational database management system
+
+- **relation* (or predicate) is a bool function of multiple arguments (attributes), e.g., _person_ relation with attributes _name_, _age_
+- predicate returns true if its attributes are factual
+
+In fact, Bob is 18.
+
+    func person(name string, age int) bool { ... }
+
+    fmt.Println("Is Bob 18?", person("Bob", 18)) // true
+    fmt.Println("Is Bob 21?", person("Bob", 21)) // false
+
+: Each attribute can have values defined in its domain.
+: Domain is a nonempty math set of scalars, e.g., abstract domains (integers, strings, dates) or concrete domains (length, weight, price).
+: A scalar is a single element of a number field such as a real number, often accompanied by units of measurement, e.g., cm.
+
+* Relational calculus (declarative query language)
+
+Since predicates' values are bool, you can make new predicates based on existing ones using logical operations (OR, AND, NOT)
+
+A database query is a predicate expressed as a logical formula
+
+Database needs to find attribute values that make the formula true
+
+: Calculus is a declarative query language
+
+* Relation as set
+
+: Since predicate is a function that returns only true or false, we can find two sets of attribute values: set of true values, set of false values.
+
+Predicate can be written down as math set of factual attributes (values where formula returns true) which in turn can be represented as a table
+
+An element in that set is called a *tuple* (or row in table representation)
+
+In fact, Bob is 18, Alice is 21.
+
+    {
+        (name="Bob", age=18),   // person("Bob", 18) == true
+        (name="Alice", age=21), // person("Alice", 21) == true
+    }
+
+    | name  | age
+    | ---   | ---
+    | Bob   | 18
+    | Alice | 21
+
+: Algebra (e.g., linear, bool) is a set and certain operations defined on it to create expressions; an operation result is also belongs to the set.
+
+: Relational algebra is defined on relations set with the following operations:
+: - selection (or filtration, e.g., "WHERE age > 16")
+: - projection (relation with fewer attributes, e.g., "SELECT DISTINCT name")
+: - Cartesian product (combination of all possible pairs, e.g., "SELECT * FROM courses, exams")
+: - join (product and then selection, e.g., "FROM courses, exams WHERE courses.id = exams.course_id")
+
+: Relational calculus is declarative.
+: Relational algebra is imperative but allows optimization.
+
+* Tuple
+
+An immutable record with typed attributes is called a tuple (or cortege)
+
+    (
+        name string = "Bob"
+        age int = 18
+    )
+
+The term originated as an abstraction of the sequence: single, couple, triple, quadruple, quintuple, sextuple, septuple, octuple, ..., n‑*tuple*
+
+[[https://en.wikipedia.org/wiki/Tuple#Etymology][* etymology]]
+
+* Postgres relation
+
+Postgres query result is a relation
+
+    # SELECT * FROM person;
+    name  | age
+    ------+-----
+    Bob   |  18
+    Alice |  21
+
+_pg__class_ is where you can find description of relations such as tables, views, indexes, sequences
+
+    # SELECT relname FROM pg_class;
+       relname
+    -------------
+    person
+    pg_statistic
+    pg_type
+    ...
+
+* Relation files
+
+Where is a relation stored on disk?
+
+    # SELECT pg_relation_filepath('person') AS table, pg_relation_filepath('person_name') as index;
+         table       |      index
+    -----------------+------------------
+    base/16488/16493 | base/16488/16500
+
+    # \! ls /usr/local/pgsql/data/base/16488 | grep 16493
+    16493
+    16493_fsm
+    16493_vm
+
+_16493_ is a main layer that contains table tuples, _16500_ contains index tuples
+
+Each file (~1 GB) is logically divided by 8 KB blocks called *pages*
+
+Page starts with a header which describes page content (e.g., table page, index page)
+
+: 16493_fsm is a segment file of FSM layer (free space map) to keep track of available space in the relation.
+: When we're inserting a new tuple, Postgres needs to know where a tuple can be written.
+: Postgres can't just check every page for sufficient free space.
+: FSM file is a place (a tree) that helps to find such free pages.
+
+: 16493_vm is a segment file of VM layer (visibility map) to keep track of pages that contain only tuples
+: that are visible to all active transactions.
+: In other words that the page does not contain any tuples that need to be vacuumed.
+: This information can also be used by index-only scans to answer queries using only the index tuple.
+
+* Postgres tuple
+
+Multiple processes (readers and writers) concurrently work with _person_ table
+
+    # INSERT INTO person(name, age) VALUES ('Eve', 19); -- Current transaction id is 29410.
+    # UPDATE person SET age=80 WHERE name='Eve'; -- Current transaction id is 29411.
+    # UPDATE person SET age=20 WHERE name='Eve'; -- Current transaction id is 29412.
+
+_Eve_ row has three versions each represented with two numbers (transaction IDs)
+
+- *xmin* is when the version was created
+- *xmax* is when the version was deleted
+
+    xmin  |  xmax |  data
+    ------+-------+--------
+    29410 | 29411 | Eve,18
+    29411 | 29412 | Eve,80
+    29412 |     0 | Eve,20
+
+: Readers don't block anyone, writers don't block readers, writers block writers who update the same row.
+
+: Old and new tuple versions are stored at the same place. Therefore tables and indexes grow in size. They need to be cleaned up (vacuumed).
+: If a table is updated frequently and vacuum doesn't come often,
+: the segment files grow is size and don't shrink, because vacuum doesn't change their structure;
+: it only marks unused tuple space as usable again.
+: Full "cleaning" restructures files making them compact, but that requires a table lock.
+
+: In Postgres "commit" operation is cheap (only a bit is set in xact).
+: The cost of marking a tuple as committed is moved to another tx that needs to work with that tuple (on next read or write).
+
+* Heap only tuple (HOT)
+
+"Heap" in this case means "table", its data (a bunch of table tuples)
+
+- *ctid* tuple ID is a pair (page number, tuple number within page) that denotes the physical location of the tuple
+- *t_ctid* points to the next tuple version
+- *hot* "heap only tuple" means a page tuple doesn't have pointers from index tuples
+- *hhu* means a tuple was "heap hot updated": a chain of tuple IDs must be followed
+
+    ctid  | t_ctid | hhu | hot |  xmin |  xmax |  data
+    ------+--------+-----+-----+-------+-------+--------
+    (0,1) |  (0,2) |  t  |     | 29410 | 29411 | Eve,18
+    (0,2) |  (0,3) |  t  |  t  | 29411 | 29412 | Eve,80
+    (0,3) |  (0,3) |     |  t  | 29412 |     0 | Eve,20
+
+*HOT*update* mechanism prevents creation of wasteful index tuples and enables in-page cleaning (less work for vacuum)
+
+: HOT update is performed when an updated field is not part of any index and table page has free space
+
+: Table updates require index updates -- INSERT/UPDATE performance degradation. More indexes, more performance degradation.
+: Index accumulates pointers to irrelevant tuple versions -- index size grows which requires cleaning (extra work for vacuum).
+
+* The oversized attribute storage technique (TOAST)
+
+Postgres requires a tuple to fit into a single page, but 8 KB is not enough in practise
+
+The oversized attribute storage technique allows to store a large attribute value (e.g., text, numeric, json) in a special table called TOAST:
+
+- split the value into page-sized chunks
+- fetch and concat the chunks when reading a tuple
+
+This makes the original table smaller because it contains a reference to a TOAST table, but there is an overhead when a large field is frequently used
+
+    # SELECT relname, relfilenode FROM pg_class WHERE oid = (
+        -- Find OID (16497) of TOAST table by table name "person" for which TOAST table was created.
+        SELECT reltoastrelid FROM pg_class WHERE relname = 'person'
+    );
+       relname     | relfilenode
+    ---------------+-------------
+    pg_toast_16493 |       16497
+
+: OIDs are object IDs used internally by PostgreSQL as primary keys for various system tables.
+
+: \! ls /usr/local/pgsql/data/base/16488 | grep 16497
+: 16497
+: 16497_fsm
+
+* Buffer cache
+
+Buffer cache is an array of buffers located in shared memory of Postgres processes
+
+A buffer stores a page and where it was read from, its state
+
+: A process needs to read a page, it checks buffer cache first.
+: If a page wasn't there, then Postgres asks OS to read a certain page into buffer cache.
+: OS first looks up that page in its cache, and then checks disk if there was cache miss: OS reads from disk,
+: then writes data into OS cache, then Postgres puts data into buffer cache.
+
+When buffer cache becomes full
+
+- Postgres evicts least recently used page
+- if the page was modified, it's considered *dirty* and must be written on disk
+- changes are sequentially written into WAL on each transaction commit with fsync
+
+Write ahead log (WAL) is a stream of executed actions (segment files of 16 MB)
+
+Checkpointer process periodically writes all dirty pages on disk (this helps to keep WAL size fairly small)
+
+: Old WAL can be deleted after checkpoint was created.
+
+* Conclusion
+
+Tables, views, indexes, sequences are relations
+
+Table rows, indexed rows are tuples (table tuples, index tuples); elements of a relation
+
+Heap only tuple (HOT) is a table tuple that doesn't have pointers from index tuples
+
+The oversized attribute storage technique (TOAST) makes sure a tuple fits into a page
+
+Page is a logical block (8 KB) of a segment file where tuples are physically stored
+
+Buffer cache is in-memory representation of array of pages (one buffer per page)
+
+* References
+
+- [[https://postgrespro.ru/education/courses/DBA1][Администрирование PostgreSQL 10. Базовый курс]] Егор Рогов, Павел Лузанов
+- [[https://postgrespro.ru/education/courses/DBA2][Администрирование PostgreSQL 10. Настройка и мониторинг]] Егор Рогов, Павел Лузанов
+- [[https://postgrespro.ru/education/university/dbtech][Основы технологий баз данных]] Борис Новиков
+- [[https://www.postgresql.org/docs/current/storage.html][Database Physical Storage]] chapter of the PostgreSQL docs
