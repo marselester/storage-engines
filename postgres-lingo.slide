@@ -172,18 +172,25 @@ _Eve_ row has three versions each represented with two numbers (transaction IDs)
     (0,2) |  (0,3) |  t  |  t  | 29411 | 29412 | Eve,80
     (0,3) |  (0,3) |     |  t  | 29412 |     0 | Eve,20
 
+* HOT update
+
+Table updates must be reflected in its indices
+
+- more indices, slower queries
+- index bloats (extra work for vacuum) because it accumulates pointers to irrelevant table tuple versions
+
 *HOT*update* mechanism prevents creation of wasteful index tuples and enables in-page cleaning (less work for vacuum)
 
-: HOT update is performed when an updated field is not part of any index and table page has free space
+It works when an updated field is not part of any index and table page has free space
 
-: Table updates require index updates -- INSERT/UPDATE performance degradation. More indexes, more performance degradation.
-: Index accumulates pointers to irrelevant tuple versions -- index size grows which requires cleaning (extra work for vacuum).
+- you can reserve 50% of page space for updates with `fillfactor=50`
+- chain of updates works only within a single page
 
 * The oversized attribute storage technique (TOAST)
 
 Postgres requires a tuple to fit into a single page, but 8 KB is not enough in practise
 
-The oversized attribute storage technique allows to store a large attribute value (e.g., text, numeric, json) in a special table called TOAST:
+The oversized attribute storage technique allows to compress/store a large attribute value (e.g., text, numeric, json) in a special table called TOAST
 
 - split the value into page-sized chunks
 - fetch and concat the chunks when reading a tuple
@@ -204,6 +211,17 @@ This makes the original table smaller because it contains a reference to a TOAST
 : 16497
 : 16497_fsm
 
+* TOAST strategies
+
+TOAST is triggered when a row value is wider than `TOAST_TUPLE_THRESHOLD` (2 kB)
+
+It compresses and/or moves field values until the row value is shorter than `TOAST_TUPLE_TARGET` (2 kB)
+
+- *extended* (default) tries compression but quickly resorts to separate storage
+- *main* priority is compression; if compression fails, value is moved to separate storage
+- *external* is separate storing without compression (makes substring operations on wide text columns faster at the penalty of increased storage space)
+- *plain* no compression, no separate storage
+
 * Buffer cache
 
 Buffer cache is an array of buffers located in shared memory of Postgres processes
@@ -223,7 +241,9 @@ When buffer cache becomes full
 
 Write ahead log (WAL) is a stream of executed actions (segment files of 16 MB)
 
-Checkpointer process periodically writes all dirty pages on disk (this helps to keep WAL size fairly small)
+_checkpointer_ process periodically writes all dirty pages on disk (this helps to keep WAL size fairly small), _bgwriter_ writes dirty pages that will likely be evicted soon, _backend_ also writes dirty pages on disk if there are not enough buffers for a query
+
+: Checkpointer writes recovery information into the control file (longer it takes to write, longer the recovery will be).
 
 : Old WAL can be deleted after checkpoint was created.
 
