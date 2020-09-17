@@ -61,8 +61,7 @@ In fact, Bob is 18, Alice is 21.
 : - Cartesian product (combination of all possible pairs, e.g., "SELECT * FROM courses, exams")
 : - join (product and then selection, e.g., "FROM courses, exams WHERE courses.id = exams.course_id")
 
-: Relational calculus is declarative.
-: Relational algebra is imperative but allows optimization.
+: Relational calculus is declarative. Relational algebra is imperative but allows optimization.
 
 * Tuple
 
@@ -111,19 +110,18 @@ Where is a relation stored on disk?
     16493_fsm
     16493_vm
 
-_16493_ is a main layer that contains table tuples, _16500_ contains index tuples
+_16493_ is a main fork that contains table tuples, _16500_ contains index tuples
 
 Each file (~1 GB) is logically divided by 8 KB blocks called *pages*
 
 Page starts with a header which describes page content (e.g., table page, index page)
 
-: 16493_fsm is a segment file of FSM layer (free space map) to keep track of available space in the relation.
+: 16493_fsm is a segment file of FSM fork (free space map) to keep track of available space in the relation.
 : When we're inserting a new tuple, Postgres needs to know where a tuple can be written.
 : Postgres can't just check every page for sufficient free space.
 : FSM file is a place (a tree) that helps to find such free pages.
 
-: 16493_vm is a segment file of VM layer (visibility map) to keep track of pages that contain only tuples
-: that are visible to all active transactions.
+: 16493_vm is a segment file of VM fork (visibility map) to keep track of pages that contain only tuples that are visible to all active transactions.
 : In other words that the page does not contain any tuples that need to be vacuumed.
 : This information can also be used by index-only scans to answer queries using only the index tuple.
 
@@ -137,8 +135,8 @@ Multiple processes (readers and writers) concurrently work with _person_ table
 
 _Eve_ row has three versions each represented with two numbers (transaction IDs)
 
-- *xmin* is when the version was created
-- *xmax* is when the version was deleted
+- *xmin* is when the row version was created
+- *xmax* is when the row version was deleted
 
     xmin  |  xmax |  data
     ------+-------+--------
@@ -148,21 +146,19 @@ _Eve_ row has three versions each represented with two numbers (transaction IDs)
 
 : Readers don't block anyone, writers don't block readers, writers block writers who update the same row.
 
-: Old and new tuple versions are stored at the same place. Therefore tables and indexes grow in size. They need to be cleaned up (vacuumed).
-: If a table is updated frequently and vacuum doesn't come often,
-: the segment files grow is size and don't shrink, because vacuum doesn't change their structure;
-: it only marks unused tuple space as usable again.
+: Old and new row versions are stored at the same place.
+: If a table is updated frequently and vacuum doesn't come often, the segment files grow is size and don't shrink, because vacuum doesn't change their structure; it only marks unused tuple space as usable again.
 : Full "cleaning" restructures files making them compact, but that requires a table lock.
 
 : In Postgres "commit" operation is cheap (only a bit is set in xact).
 : The cost of marking a tuple as committed is moved to another tx that needs to work with that tuple (on next read or write).
 
-* Heap only tuple (HOT)
+* Heap-only tuple (HOT)
 
 "Heap" in this case means "table", its data (a bunch of table tuples)
 
 - *ctid* tuple ID is a pair (page number, tuple number within page) that denotes the physical location of the tuple
-- *t_ctid* points to the next tuple version
+- *t_ctid* points to the next row version
 - *hot* "heap only tuple" means a page tuple doesn't have pointers from index tuples
 - *hhu* means a tuple was "heap hot updated": a chain of tuple IDs must be followed
 
@@ -172,14 +168,15 @@ _Eve_ row has three versions each represented with two numbers (transaction IDs)
     (0,2) |  (0,3) |  t  |  t  | 29411 | 29412 | Eve,80
     (0,3) |  (0,3) |     |  t  | 29412 |     0 | Eve,20
 
-* HOT update
+* Heap-only tuple update
 
 Table updates must be reflected in its indices
 
 - more indices, slower queries
-- index bloats (extra work for vacuum) because it accumulates pointers to irrelevant table tuple versions
+- extra work for vacuum to remove accumulated pointers to irrelevant table tuples
+- index size might not shrink even after removing many tuples (index page split)
 
-*HOT*update* mechanism prevents creation of wasteful index tuples and enables in-page cleaning (less work for vacuum)
+*HOT*update* mechanism prevents creation of wasteful index tuples and facilitates in-page cleaning (less work for vacuum)
 
 It works when an updated field is not part of any index and table page has free space
 
@@ -213,14 +210,14 @@ This makes the original table smaller because it contains a reference to a TOAST
 
 * TOAST strategies
 
-TOAST is triggered when a row value is wider than `TOAST_TUPLE_THRESHOLD` (2 kB)
+TOAST is triggered when a tuple is wider than 1/4 of a page, `TOAST_TUPLE_THRESHOLD` (2 KB)
 
-It compresses and/or moves field values until the row value is shorter than `TOAST_TUPLE_TARGET` (2 kB)
+It compresses and/or moves field values until the tuple is shorter than `TOAST_TUPLE_TARGET` (2 KB)
 
 - *extended* (default) tries compression but quickly resorts to separate storage
-- *main* priority is compression; if compression fails, value is moved to separate storage
-- *external* is separate storing without compression (makes substring operations on wide text columns faster at the penalty of increased storage space)
-- *plain* no compression, no separate storage
+- *main* priority is compression; if compression didn't help, value is moved to separate storage
+- *external* is for separate storing without compression (makes substring operations on wide text columns faster at the penalty of increased storage space)
+- *plain* allows no compression, no separate storage
 
 * Buffer cache
 
@@ -230,8 +227,7 @@ A buffer stores a page and where it was read from, its state
 
 : A process needs to read a page, it checks buffer cache first.
 : If a page wasn't there, then Postgres asks OS to read a certain page into buffer cache.
-: OS first looks up that page in its cache, and then checks disk if there was cache miss: OS reads from disk,
-: then writes data into OS cache, then Postgres puts data into buffer cache.
+: OS first looks up that page in its cache, and then checks disk if there was cache miss: OS reads from disk, then writes data into OS cache, then Postgres puts data into buffer cache.
 
 When buffer cache becomes full
 
@@ -247,13 +243,25 @@ _checkpointer_ process periodically writes all dirty pages on disk (this helps t
 
 : Old WAL can be deleted after checkpoint was created.
 
+* Buffers in explain
+
+You can see how many buffers were used in a query plan
+
+- *shared*hit=2* means two pages were found in a buffer cache
+- *read=1* means one page was read from a disk and it took 50 ms
+
+    # EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM person;
+    ...
+    Buffers: shared hit=2 read=1
+    I/O Timings: read=50
+
 * Conclusion
 
 Tables, views, indexes, sequences are relations
 
 Table rows, indexed rows are tuples (table tuples, index tuples); elements of a relation
 
-Heap only tuple (HOT) is a table tuple that doesn't have pointers from index tuples
+Heap-only tuple (HOT) is a table tuple that doesn't have pointers from index tuples
 
 The oversized attribute storage technique (TOAST) makes sure a tuple fits into a page
 
