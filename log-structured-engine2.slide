@@ -1,0 +1,287 @@
+Log-structured storage engine
+18 Dec 2023
+
+Marsel Mavletkulov
+@marselester
+
+* Log
+
+: What's the definition of a log?
+
+Your favourite database probably uses *log-structured* (LSM-tree) or *page-oriented* storage engine (B-tree)
+
+- LSM-tree: Cassandra, LevelDB, RocksDB, Google BigTable
+- B-tree: PostgreSQL, MySQL, SQLite, Bolt (etcd)
+
+In this presentation we'll look at ideas behind log-based key-value stores
+
+    🪵 k:v | k:v | k:v | k:v | k:v | k:v | k:v | k:v | k:v
+                                                       newest record
+
+Log is an append-only file to store sequence of records:
+
+- sequential writes are faster than random (frequent seek and rotational delays)
+- record lookup requires scanning the entire file from beginning *O(n)*
+
+: Average seek latency is 9 ms (most common desktop drives) or 4 ms (high-end server drives).
+: Average rotational latency is 4.17 ms at 7200 RPM, 3 ms at 10K RPM, 2 ms at 15K RPM.
+: Smallest disk IO is 4 KB (sector size); it used to be 512 bytes.
+
+* Disk I/O
+
+: Since we've mentioned disk writes and reads, let's take a closer look at disk IO.
+
+* Input/output operations
+
+: What's the definition of IO?
+: Why do most of disk benchmarks look great?
+
+I/O operation is a read or write of certain size (e.g., 4 KiB) at specific disk address. These operations can be:
+
+- reordered to be sequential 👍
+- merged into one bigger I/O 👍
+- queued up (by kernel, by disk) causing delays 👎
+
+* Caching and buffering
+
+: The performance of disk IO can be improved by caching and buffering.
+
+Disk reads:
+
+- served from memory if found in the buffer cache
+- prefetched (read ahead) by kernel when sequential pattern is observed
+- served from disk's DRAM if data was cached
+
+Disk writes:
+
+- buffered in memory unless fsync was called
+- buffered in disk's DRAM
+
+: There is a capacitor on disk to flush buffered data on disk in case of a power outage.
+
+* Newer disks tested using 8 KiB blocks
+
+: We can observe those effects in benchmarks.
+
+HDD
+
+- random read/write: 10 ms latency, 0.7 MiB/s throughput
+- sequential read/write: 10 ms latency, 250 MiB/s throughput
+
+: HDD sequential IOs are ~357x faster than random (0.7 MiB/s vs 250 MiB/s).
+
+SSD
+
+- random read: 100 μs latency, 70 MiB/s throughput
+- sequential read: 1 μs latency, 4 GiB/s throughput
+- random write: ? (small block writes are susceptible to write amplification)
+- sequential write: 10 μs latency (1 ms with fsync), 1 GiB/s throughput (10 MiB/s with fsync)
+
+: SSD sequential reads are ~58x faster than random (4 GiB/s vs 70 MiB/s) maybe due to prefetching.
+
+Estimates from [[https://github.com/sirupsen/napkin-math]]
+
+: Flash memory must be erased before it can be rewritten to. Data is written to the flash memory in units called pages. The memory can be erased only in larger units called blocks.
+
+* Older HDD tested using 4 KiB blocks
+
+: In these read benchmarks buffer cache effects were eliminated.
+: We can see that random reads spend 95.6% of time seeking instead of actually transferring data.
+
+40 MiB file is opened with O_DIRECT to skip the buffer cache and read directly from disk
+
+- random 10,240 reads: 0.6 MiB/s throughput (1 min of seeks, 6.6 sec of data transfer)
+- sequential 10,240 reads: 27 MiB/s throughput, took 24% of CPU time
+
+: Sequential reads are 45x faster than random (0.6 MiB/s vs 27 MiB/s), max disk throughput is 60 MiB/s.
+
+40 MiB block size:
+
+- read at once: 60 MiB/s throughput, took 1% of CPU time
+- write at once: 4.7 GiB/s throughput (from user's buffer to kernel's memory), 48 MiB/s with fsync (transfer to disk)
+
+: Increasing the block size from 4 KiB to 40 MiB made possible to read at 100% of disk throughput (27 MiB/s vs 60 MiB/s).
+
+HDD seek takes 13 ms (13,000 μs)
+
+Benchmarks from "Understanding Software Dynamics" book
+
+* Older SSD tested using 4 KiB blocks
+
+40 MiB file is opened with O_DIRECT to skip the buffer cache and read directly from disk
+
+- random 10,240 reads: 44 MiB/s throughput (84 MiB/s with two threads)
+- sequential 10,240 reads: 73 MiB/s throughput, took 7.5% of CPU time
+
+: Sequential reads are 1.66x faster than random (44 MiB/s vs 73 MiB/s), max disk throughput is 700 MiB/s.
+
+40 MiB block size:
+
+- read at once: 700 MiB/s throughput
+- write at once: 4.6 GiB/s throughput (from user's buffer to kernel's memory), 587 MiB/s with fsync (transfer to disk)
+
+: Increasing the block size from 4 KiB to 40 MiB made possible to read at 100% of disk throughput (73 MiB/s vs 700 MiB/s).
+
+SSD seek takes 90 μs
+
+: Why random read throughput improves when there are two readers? SSDs usually have multiple banks of flash memory which can be accessed simultaneously.
+
+* Takeaways
+
+- SSD can transfer ~10x and seek ~100x faster than HDD
+- HDD sequential I/O is ~45x faster than random I/O (4 KiB, O_DIRECT)
+- SSD sequential I/O is somewhat similar to random I/O (4 KiB, O_DIRECT)
+
+I/O size matters: transferring 4 KiB at a time incurs performance loss in the range of factor of 2 to 100
+
+According to Half-Useful performance principle the useful work (data transfer) must take at least as long as the startup time (seek time):
+
+- should read or write ~1 MiB per HDD seek
+- should read or write ~64 KiB per SSD seek
+
+* Log-structured hash table
+
+: Getting back to our logs. How can we avoid scanning the entire file to find a record?
+
+* Hash table
+
+: Store file offsets in a hash table map[record_key]file_offset.
+
+Index based on hash table helps to locate the record faster *O(1)*
+
+In-memory hash table:
+
+- _key_ points to a byte offset in the log file where record is stored
+- look up record's offset by _key_ from the hash table, then read the record from the log
+- when a new record is appended, the hash table points to the new offset
+
+* Segment
+
+If records are appended to one file forever, there will be no disk space left
+
+The log is split into multiple files (segments):
+
+- file is closed when it reaches certain size
+- a new file is created to continue appending records
+- duplicate keys are thrown away from the files (log compaction)
+- compacted segments are merged into a new segment file (old segments are deleted)
+
+* Key lookup in segments
+
+Each segment has its own hash table
+
+- start _key_ lookup from the most recent segment (using its hash table)
+- check second-most-recent segment if _key_ wasn't found
+- since segments are periodically merged (less files), search finishes quickly
+
+* Deleting keys
+
+Append ☠️ special deletion record (tombstone) to mark the _key_ for deletion
+
+Old records associated with the _key_ will be discarded when segments are merged
+
+* Concurrency
+
+Since appends are sequential, there is only one writer
+
+Multiple readers can read concurrently because segments are immutable
+
+* Partial writes and lost indexes
+
+Database might crash while appending a record
+Riak's Bitcask ignores records whose checksums don't match
+
+Bitcask stores a snapshot of in-memory hash table on disk to speed up restarts
+If index gets corrupted, it can be always created from segment files (slow restart)
+
+* Example: github.com/marselester/rascaldb
+
+: I wrote RascalDB in order to get a better grasp of the idea.
+
+*Set(key=fizz,*value=bazz)*
+
+- encode key-value as record (4.295 GiB max size): 4 bytes of record length + key + delimiter byte + value
+- record is appended to the segment file at offset *13*
+- file's offset is stored in the hash table *h[fizz]*=*13*
+
+*Get(key=fizz)*
+
+- look up the offset *h[fizz]* in the hash table, and read a record from the segment file
+- if key wasn't found, check the hash table that belongs to the previous segment
+
+* LSM storage engine
+
+: Finally, let's look at the LSM storages.
+
+* LSM-Tree
+
+: What's an LSM-Tree?
+
+Log-Structured Merge-Tree (LSM-Tree) indexing structure:
+
+- records are written into the memtable
+- the memtable is periodically saved to the SSTable
+
+* SSTable (segment)
+
+: What's an SSTable? It's a log format.
+
+Sorted String Table log format:
+
+- records are stored in segment file sorted by _key_
+- each _key_ appears only once within a file
+
+Advantages:
+
+- efficient merging of segments because they are sorted by _key_ (k-way merge)
+- no need to hold all keys (byte offsets) in memory index: one _key_ for every few kilobytes is sufficient
+
+: Key in a sparse index points to a byte offset in segment file where block is stored.
+
+* Memtable (tree index)
+
+: What's a memtable? It's a tree.
+
+: Average cost of search/insert in red-black BST is O(lg N), worst case is O(2*lg N).
+
+In-memory binary search tree (BST) is used to keep keys sorted:
+
+- a new record is added into a balanced tree (memtable) *O(lg*n)*
+- the tree is written to disk in SSTable format when the tree is a few megabytes big
+- SSTable is efficiently created from BST because it maintains keys in sorted order
+- new records are added into the new memtable while SSTable is being written to disk
+
+Range queries are efficient since data is stored in sorted order
+
+* Key lookup
+
+- start _key_ lookup from the memtable
+- check the most recent segment (using its sparse index) if _key_ wasn't found
+
+Often LSM storage engines speed up _key_ lookups with [[https://github.com/marselester/bloom][Bloom filters]] to avoid searching for non-existent keys
+
+* Example: github.com/marselester/hastydb
+
+*Set(key=fizz,*value=bazz)*
+
+- key-value is written into the red-black tree *t.Set(fizz,*bazz)*
+- encoded key-value record is appended to the WAL file at offset *13*
+- if the tree size exceeded 4 MiB, rotate it: write records in ascending order to new segment file, create a new tree to handle new writes, rotate the WAL file
+
+*Get(key=fizz)*
+
+- look up the value *t.Get(fizz)* in the tree, and then check the tree being written down to segment file
+- if key wasn't found, look up file offsets in the hash tables that belong to segment files
+
+: Instead of a hash table one can use a tree to implement range queries.
+
+Segments get merged and compacted into a single segment using min priority queue
+
+* References
+
+- [[https://dataintensive.net/][Designing Data-Intensive Applications]] Martin Kleppmann
+- [[https://www.brendangregg.com/systems-performance-2nd-edition-book.html][Systems Performance]] Brendan Gregg
+- [[https://www.goodreads.com/book/show/57850403][Understanding Software Dynamics]] Richard L. Sites
+- [[https://algs4.cs.princeton.edu][Algorithms]] Robert Sedgewick and Kevin Wayne
+- [[https://www.databass.dev][Database Internals]] Alex Petrov
+- [[https://en.wikipedia.org/wiki/Hard_disk_drive_performance_characteristics]]
