@@ -42,6 +42,8 @@ I/O operation is a read or write of certain size (e.g., 4 KiB) at specific disk 
 - merged into one bigger I/O 👍
 - queued up (by kernel, by disk) causing delays 👎
 
+: Kernel queueing (IO Scheduler Queue & Dispatch Queue), on-disk IO queueing.
+
 * Caching and buffering
 
 : The performance of disk IO can be improved by caching and buffering.
@@ -49,7 +51,7 @@ I/O operation is a read or write of certain size (e.g., 4 KiB) at specific disk 
 Disk reads:
 
 - served from memory if found in the buffer cache
-- prefetched (read ahead) by kernel when sequential pattern is observed
+- prefetched (read ahead) by the file system when sequential pattern is observed
 - served from disk's DRAM if data was cached
 
 Disk writes:
@@ -57,7 +59,7 @@ Disk writes:
 - buffered in memory unless fsync was called
 - buffered in disk's DRAM
 
-: There is a capacitor on disk to flush buffered data on disk in case of a power outage.
+: Batteries on disk or disk controller allow buffered data to be saved in case of a power outage.
 
 * Newer disks tested using 8 KiB blocks
 
@@ -194,15 +196,18 @@ Riak's Bitcask ignores records whose checksums don't match
 Bitcask stores a snapshot of in-memory hash table on disk to speed up restarts
 If index gets corrupted, it can be always created from segment files (slow restart)
 
-* Example: github.com/marselester/rascaldb
+* Toy example: github.com/marselester/rascaldb
 
 : I wrote RascalDB in order to get a better grasp of the idea.
 
 *Set(key=fizz,*value=bazz)*
 
 - encode key-value as record (4.295 GiB max size): 4 bytes of record length + key + delimiter byte + value
-- record is appended to the segment file at offset *13*
-- file's offset is stored in the hash table *h[fizz]*=*13*
+- record is appended to the segment file at offset *0x100*
+- file's offset is stored in the hash table *h[fizz]*=*0x100*
+
+    🪵 k:v | ... | k:v = {length=13, key=fizz, delimiter=🚧, value=bazz}
+       0           0x100
 
 *Get(key=fizz)*
 
@@ -215,7 +220,7 @@ If index gets corrupted, it can be always created from segment files (slow resta
 
 * LSM-Tree
 
-: What's an LSM-Tree?
+: What does an LSM-Tree stand for?
 
 Log-Structured Merge-Tree (LSM-Tree) indexing structure:
 
@@ -224,7 +229,7 @@ Log-Structured Merge-Tree (LSM-Tree) indexing structure:
 
 * SSTable (segment)
 
-: What's an SSTable? It's a log format.
+: Let's define an SSTable term first. It's a log format.
 
 Sorted String Table log format:
 
@@ -240,7 +245,7 @@ Advantages:
 
 * Memtable (tree index)
 
-: What's a memtable? It's a tree.
+: How can we efficiently write key-values in SSTable format? Using a tree!
 
 : Average cost of search/insert in red-black BST is O(lg N), worst case is O(2*lg N).
 
@@ -260,12 +265,12 @@ Range queries are efficient since data is stored in sorted order
 
 Often LSM storage engines speed up _key_ lookups with [[https://github.com/marselester/bloom][Bloom filters]] to avoid searching for non-existent keys
 
-* Example: github.com/marselester/hastydb
+* Toy example: github.com/marselester/hastydb
 
 *Set(key=fizz,*value=bazz)*
 
 - key-value is written into the red-black tree *t.Set(fizz,*bazz)*
-- encoded key-value record is appended to the WAL file at offset *13*
+- encoded key-value record is appended to the WAL file at offset *0x100*
 - if the tree size exceeded 4 MiB, rotate it: write records in ascending order to new segment file, create a new tree to handle new writes, rotate the WAL file
 
 *Get(key=fizz)*
